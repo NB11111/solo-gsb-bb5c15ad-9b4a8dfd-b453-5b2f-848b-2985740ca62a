@@ -987,8 +987,18 @@ _ACTIVE_CLAIMS_SQL = """
 """
 
 
-def _active_claim_rows(conn: sqlite3.Connection, roll_no: str) -> list[sqlite3.Row]:
-    return conn.execute(_ACTIVE_CLAIMS_SQL, (roll_no, _now_iso())).fetchall()
+def _active_claim_rows(
+    conn: sqlite3.Connection, roll_no: str, now: str | None = None
+) -> list[sqlite3.Row]:
+    """读取当前未到期、未释放、未结案的认领。
+
+    ``now`` 为调用方在已开启事务内取得的判定时间（写事务须在拿到写锁
+    **之后**取钟，避免锁等待跨越有效期造成误判）；缺省时即时取钟，
+    供无事务的只读列表使用。
+    """
+    return conn.execute(
+        _ACTIVE_CLAIMS_SQL, (roll_no, now if now is not None else _now_iso())
+    ).fetchall()
 
 
 def _claim_out(conn: sqlite3.Connection, r: sqlite3.Row) -> schemas.RescanClaimOut:
@@ -1020,22 +1030,28 @@ def create_rescan_claim(
     当前缺帧区间扣除所有未到期认领区间后，按帧号升序取首段长度不超过
     max_frames 的连续闭区间；整个过程在 BEGIN IMMEDIATE 写事务内完成，
     并发领取由 SQLite 写锁串行化，帧段不会交叠。
-    """
-    base = datetime.now(timezone.utc)
-    now = base.strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z"
-    expires = (base + timedelta(seconds=data.ttl_seconds)).strftime(
-        "%Y-%m-%dT%H:%M:%S.%f"
-    )[:-3] + "Z"
 
+    判定时间在 **BEGIN IMMEDIATE 成功（拿到写锁）之后**取：写锁可能因
+    并发写入而阻塞等待，若在取锁前取钟，锁等待超过 TTL 时新认领的
+    expires_at 会落在过去，返回即过期。以拿锁后的时间计算 created_at 与
+    expires_at，保证认领自事务提交起至少拥有完整的 TTL 有效期。
+    """
     conn.execute("BEGIN IMMEDIATE")
     try:
         if not _roll_exists(conn, roll_no):
             raise RollNotFoundError(roll_no)
 
+        # 拿锁后取判定钟：有效期从拿到写锁、开始读状态的时刻起算
+        base = datetime.now(timezone.utc)
+        now = base.strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z"
+        expires = (base + timedelta(seconds=data.ttl_seconds)).strftime(
+            "%Y-%m-%dT%H:%M:%S.%f"
+        )[:-3] + "Z"
+
         st = _state_from_db(conn, roll_no)
         claimed = [
             (r["frame_start"], r["frame_end"])
-            for r in _active_claim_rows(conn, roll_no)
+            for r in _active_claim_rows(conn, roll_no, now)
         ]
         available = subtract_intervals(st["missing"], claimed)
 
@@ -1173,10 +1189,14 @@ def submit_rescan_receipt(
     数据不变。校验规则：
 
     - 认领记录不存在 → ClaimNotFoundError（404）；
-    - 已到期或已释放 → ClaimUnavailableError（409）；
+    - 已到期或已释放 → ClaimUnavailableError（409）。到期判定时间在
+      **BEGIN IMMEDIATE 成功（拿到写锁）之后**取，并在同一写事务内复核：
+      即使请求在锁等待期间越过 expires_at（写锁被其他事务占用超过 TTL），
+      过期回执也一律 409 拒绝，批次、回执与认领结案状态均不变；
     - 每帧必须落在认领闭区间 [frame_start, frame_end] 内，且提交时仍属于
       该胶卷缺帧 → ReceiptConflictError（409）；
-    - 相同认领、batch_id、原始帧列表的重试：返回已存回执（200），不重复导入；
+    - 相同认领、batch_id、原始帧列表的重试：即使认领已到期也原样返回已存
+      回执（200），不重复导入、不改变结案状态（幂等重试优先于到期判定）；
     - 内容变更（batch_id 或原始帧列表不同）、对已结案认领再提交新回执、
       batch_id 已被其他回执/批次占用 → ReceiptConflictError（409）。
 
@@ -1186,10 +1206,13 @@ def submit_rescan_receipt(
     claim_id = claim_id.strip()
     frames_in = list(data.frames)
     batch_id = data.batch_id
-    now = _now_iso()
 
     conn.execute("BEGIN IMMEDIATE")
     try:
+        # 拿锁后取判定钟：锁等待可能已跨越认领 expires_at，到期复核必须以
+        # 事务内时间为准，避免“请求时未到期、拿锁后已到期”的回执蒙混入库
+        now = _now_iso()
+
         claim = conn.execute(
             "SELECT * FROM rescan_claims WHERE id = ?", (claim_id,)
         ).fetchone()
@@ -1200,7 +1223,8 @@ def submit_rescan_receipt(
             "SELECT * FROM rescan_receipts WHERE claim_id = ?", (claim_id,)
         ).fetchone()
 
-        # 幂等优先：相同认领 + 相同 batch_id + 相同原始帧列表 → 回已存回执
+        # 幂等优先于到期判定：已落库的回执不因认领到期而改变重试结果，
+        # 相同认领 + 相同 batch_id + 相同原始帧列表 → 回已存回执（200）
         if existing_receipt is not None:
             if (
                 existing_receipt["batch_id"] == batch_id
