@@ -1020,15 +1020,21 @@ def create_rescan_claim(
     当前缺帧区间扣除所有未到期认领区间后，按帧号升序取首段长度不超过
     max_frames 的连续闭区间；整个过程在 BEGIN IMMEDIATE 写事务内完成，
     并发领取由 SQLite 写锁串行化，帧段不会交叠。
-    """
-    base = datetime.now(timezone.utc)
-    now = base.strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z"
-    expires = (base + timedelta(seconds=data.ttl_seconds)).strftime(
-        "%Y-%m-%dT%H:%M:%S.%f"
-    )[:-3] + "Z"
 
+    判定时间在 BEGIN IMMEDIATE 成功、实际获得写锁之后才取，expires_at 由
+    该时间加 ttl_seconds 得出：等待写锁的耗时不计入有效期，新认领在返回时
+    绝不会已经到期。
+    """
     conn.execute("BEGIN IMMEDIATE")
     try:
+        # 写锁到手后才取时钟：锁等待可能超过 TTL，锁前取时会让新认领
+        # 在返回时就已过期
+        base = datetime.now(timezone.utc)
+        now = base.strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z"
+        expires = (base + timedelta(seconds=data.ttl_seconds)).strftime(
+            "%Y-%m-%dT%H:%M:%S.%f"
+        )[:-3] + "Z"
+
         if not _roll_exists(conn, roll_no):
             raise RollNotFoundError(roll_no)
 
@@ -1173,7 +1179,9 @@ def submit_rescan_receipt(
     数据不变。校验规则：
 
     - 认领记录不存在 → ClaimNotFoundError（404）；
-    - 已到期或已释放 → ClaimUnavailableError（409）；
+    - 已到期或已释放 → ClaimUnavailableError（409）；到期判定在同一写事务内、
+      获得写锁之后取时间复核——等待写锁期间认领跨过有效期的，按已到期拒绝，
+      批次、回执与结案状态均不变；
     - 每帧必须落在认领闭区间 [frame_start, frame_end] 内，且提交时仍属于
       该胶卷缺帧 → ReceiptConflictError（409）；
     - 相同认领、batch_id、原始帧列表的重试：返回已存回执（200），不重复导入；
@@ -1186,10 +1194,13 @@ def submit_rescan_receipt(
     claim_id = claim_id.strip()
     frames_in = list(data.frames)
     batch_id = data.batch_id
-    now = _now_iso()
 
     conn.execute("BEGIN IMMEDIATE")
     try:
+        # 判定时间在写锁到手后才取：等待写锁期间认领可能已到期，须以该时间在
+        # 同一写事务内复核 expires_at；锁前取时会让过期认领的回执继续入库
+        now = _now_iso()
+
         claim = conn.execute(
             "SELECT * FROM rescan_claims WHERE id = ?", (claim_id,)
         ).fetchone()
